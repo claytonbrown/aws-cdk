@@ -3,7 +3,8 @@ import * as iam from '@aws-cdk/aws-iam';
 import * as kms from '@aws-cdk/aws-kms';
 import * as s3 from '@aws-cdk/aws-s3';
 import * as secretsmanager from '@aws-cdk/aws-secretsmanager';
-import { Construct, Duration, IResource, RemovalPolicy, Resource, SecretValue, Token } from '@aws-cdk/core';
+import { Duration, IResource, RemovalPolicy, Resource, SecretValue, Token } from '@aws-cdk/core';
+import { Construct } from 'constructs';
 import { DatabaseSecret } from './database-secret';
 import { Endpoint } from './endpoint';
 import { IClusterParameterGroup } from './parameter-group';
@@ -39,6 +40,14 @@ export enum NodeType {
    * dc2.8xlarge
    */
   DC2_8XLARGE = 'dc2.8xlarge',
+  /**
+   * ra3.xlplus
+   */
+  RA3_XLPLUS = 'ra3.xlplus',
+  /**
+   * ra3.4xlarge
+   */
+  RA3_4XLARGE = 'ra3.4xlarge',
   /**
    * ra3.16xlarge
    */
@@ -306,6 +315,13 @@ export interface ClusterProps {
    * @default RemovalPolicy.RETAIN
    */
   readonly removalPolicy?: RemovalPolicy
+
+  /**
+   * Whether to make cluster publicly accessible.
+   *
+   * @default false
+   */
+  readonly publiclyAccessible?: boolean
 }
 
 /**
@@ -398,11 +414,11 @@ export class Cluster extends ClusterBase {
     super(scope, id);
 
     this.vpc = props.vpc;
-    this.vpcSubnets = props.vpcSubnets ? props.vpcSubnets : {
+    this.vpcSubnets = props.vpcSubnets ?? {
       subnetType: ec2.SubnetType.PRIVATE,
     };
 
-    const removalPolicy = props.removalPolicy ? props.removalPolicy : RemovalPolicy.RETAIN;
+    const removalPolicy = props.removalPolicy ?? RemovalPolicy.RETAIN;
 
     const subnetGroup = props.subnetGroup ?? new ClusterSubnetGroup(this, 'Subnets', {
       description: `Subnets for ${id} Redshift cluster`,
@@ -411,12 +427,10 @@ export class Cluster extends ClusterBase {
       removalPolicy: removalPolicy,
     });
 
-    const securityGroups = props.securityGroups !== undefined ?
-      props.securityGroups : [new ec2.SecurityGroup(this, 'SecurityGroup', {
-        description: 'Redshift security group',
-        vpc: this.vpc,
-        securityGroupName: 'redshift SG',
-      })];
+    const securityGroups = props.securityGroups ?? [new ec2.SecurityGroup(this, 'SecurityGroup', {
+      description: 'Redshift security group',
+      vpc: this.vpc,
+    })];
 
     const securityGroupIds = securityGroups.map(sg => sg.securityGroupId);
 
@@ -457,22 +471,20 @@ export class Cluster extends ClusterBase {
       port: props.port,
       clusterParameterGroupName: props.parameterGroup && props.parameterGroup.clusterParameterGroupName,
       // Admin
-      masterUsername: secret ? secret.secretValueFromJson('username').toString() : props.masterUser.masterUsername,
-      masterUserPassword: secret
-        ? secret.secretValueFromJson('password').toString()
-        : (props.masterUser.masterPassword
-          ? props.masterUser.masterPassword.toString()
-          : 'default'),
+      masterUsername: secret?.secretValueFromJson('username').toString() ?? props.masterUser.masterUsername,
+      masterUserPassword: secret?.secretValueFromJson('password').toString()
+        ?? props.masterUser.masterPassword?.toString()
+        ?? 'default',
       preferredMaintenanceWindow: props.preferredMaintenanceWindow,
       nodeType: props.nodeType || NodeType.DC2_LARGE,
       numberOfNodes: nodeCount,
       loggingProperties,
-      iamRoles: props.roles ? props.roles.map(role => role.roleArn) : undefined,
+      iamRoles: props?.roles?.map(role => role.roleArn),
       dbName: props.defaultDatabaseName || 'default_db',
-      publiclyAccessible: false,
+      publiclyAccessible: props.publiclyAccessible || false,
       // Encryption
       kmsKeyId: props.encryptionKey && props.encryptionKey.keyArn,
-      encrypted: props.encrypted !== undefined ? props.encrypted : true,
+      encrypted: props.encrypted ?? true,
     });
 
     cluster.applyRemovalPolicy(removalPolicy, {
@@ -546,6 +558,9 @@ export class Cluster extends ClusterBase {
       }
       return undefined;
     } else {
+      if (Token.isUnresolved(numberOfNodes)) {
+        return numberOfNodes;
+      }
       const nodeCount = numberOfNodes ?? 2;
       if (nodeCount < 2 || nodeCount > 100) {
         throw new Error('Number of nodes for cluster type multi-node must be at least 2 and no more than 100');

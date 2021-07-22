@@ -1,9 +1,11 @@
 import * as cxschema from '@aws-cdk/cloud-assembly-schema';
 import {
-  Annotations, ConcreteDependable, Construct, ContextProvider, DependableTrait, IConstruct,
-  IDependable, IResource, Lazy, Resource, Stack, Token, Tags,
+  Annotations, ConcreteDependable, ContextProvider, DependableTrait, IConstruct,
+  IDependable, IResource, Lazy, Resource, Stack, Token, Tags, Names,
 } from '@aws-cdk/core';
 import * as cxapi from '@aws-cdk/cx-api';
+import { Construct, Node } from 'constructs';
+import { ClientVpnEndpoint, ClientVpnEndpointOptions } from './client-vpn-endpoint';
 import {
   CfnEIP, CfnInternetGateway, CfnNatGateway, CfnRoute, CfnRouteTable, CfnSubnet,
   CfnSubnetRouteTableAssociation, CfnVPC, CfnVPCGatewayAttachment, CfnVPNGatewayRoutePropagation,
@@ -17,6 +19,10 @@ import { GatewayVpcEndpoint, GatewayVpcEndpointAwsService, GatewayVpcEndpointOpt
 import { FlowLog, FlowLogOptions, FlowLogResourceType } from './vpc-flow-logs';
 import { VpcLookupOptions } from './vpc-lookup';
 import { EnableVpnGatewayOptions, VpnConnection, VpnConnectionOptions, VpnConnectionType, VpnGateway } from './vpn';
+
+// v2 - keep this import as a separate section to reduce merge conflict when forward merging with the v2 branch.
+// eslint-disable-next-line
+import { Construct as CoreConstruct } from '@aws-cdk/core';
 
 const VPC_SUBNET_SYMBOL = Symbol.for('@aws-cdk/aws-ec2.VpcSubnet');
 
@@ -126,6 +132,11 @@ export interface IVpc extends IResource {
    * Adds a new VPN connection to this VPC
    */
   addVpnConnection(id: string, options: VpnConnectionOptions): VpnConnection;
+
+  /**
+   * Adds a new client VPN endpoint to this VPC
+   */
+  addClientVpnEndpoint(id: string, options: ClientVpnEndpointOptions): ClientVpnEndpoint;
 
   /**
    * Adds a new gateway endpoint to this VPC
@@ -413,6 +424,16 @@ abstract class VpcBase extends Resource implements IVpc {
     return new VpnConnection(this, id, {
       vpc: this,
       ...options,
+    });
+  }
+
+  /**
+   * Adds a new client VPN endpoint to this VPC
+   */
+  public addClientVpnEndpoint(id: string, options: ClientVpnEndpointOptions): ClientVpnEndpoint {
+    return new ClientVpnEndpoint(this, id, {
+      ...options,
+      vpc: this,
     });
   }
 
@@ -794,7 +815,7 @@ export interface VpcProps {
    * may not be available in all AWS regions.
    *
    * @default NatProvider.gateway()
-   * @experimental
+   *
    */
   readonly natGatewayProvider?: NatProvider;
 
@@ -931,7 +952,7 @@ export interface SubnetConfiguration {
    *
    * When true, the IP space for the subnet is reserved but no actual
    * resources are provisioned. This space is only dependent on the
-   * number of availibility zones and on `cidrMask` - all other subnet
+   * number of availability zones and on `cidrMask` - all other subnet
    * properties are ignored.
    *
    * @default false
@@ -1005,7 +1026,16 @@ export class Vpc extends VpcBase {
   ];
 
   /**
-   * Import an exported VPC
+   * Import a VPC by supplying all attributes directly
+   *
+   * NOTE: using `fromVpcAttributes()` with deploy-time parameters (like a `Fn.importValue()` or
+   * `CfnParameter` to represent a list of subnet IDs) sometimes accidentally works. It happens
+   * to work for constructs that need a list of subnets (like `AutoScalingGroup` and `eks.Cluster`)
+   * but it does not work for constructs that need individual subnets (like
+   * `Instance`). See https://github.com/aws/aws-cdk/issues/4118 for more
+   * information.
+   *
+   * Prefer to use `Vpc.fromLookup()` instead.
    */
   public static fromVpcAttributes(scope: Construct, id: string, attrs: VpcAttributes): IVpc {
     return new ImportedVpc(scope, id, attrs, false);
@@ -1199,7 +1229,7 @@ export class Vpc extends VpcBase {
 
     this.availabilityZones = stack.availabilityZones;
 
-    const maxAZs = props.maxAzs !== undefined ? props.maxAzs : 3;
+    const maxAZs = props.maxAzs ?? 3;
     this.availabilityZones = this.availabilityZones.slice(0, maxAZs);
 
     this.vpcId = this.resource.ref;
@@ -1337,9 +1367,9 @@ export class Vpc extends VpcBase {
     }
 
     const totalRemaining = remainingSpaceSubnets.length * this.availabilityZones.length;
-    const cidrMaskForRemaing = this.networkBuilder.maskForRemainingSubnets(totalRemaining);
+    const cidrMaskForRemaining = this.networkBuilder.maskForRemainingSubnets(totalRemaining);
     for (const subnet of remainingSpaceSubnets) {
-      this.createSubnetResources(subnet, cidrMaskForRemaing);
+      this.createSubnetResources(subnet, cidrMaskForRemaining);
     }
   }
 
@@ -1481,6 +1511,12 @@ export class Subnet extends Resource implements ISubnet {
   public readonly subnetIpv6CidrBlocks: string[];
 
   /**
+   * The Amazon Resource Name (ARN) of the Outpost for this subnet (if one exists).
+   * @attribute
+   */
+  public readonly subnetOutpostArn: string;
+
+  /**
    * @attribute
    */
   public readonly subnetNetworkAclAssociationId: string;
@@ -1520,11 +1556,12 @@ export class Subnet extends Resource implements ISubnet {
     this.subnetVpcId = subnet.attrVpcId;
     this.subnetAvailabilityZone = subnet.attrAvailabilityZone;
     this.subnetIpv6CidrBlocks = subnet.attrIpv6CidrBlocks;
+    this.subnetOutpostArn = subnet.attrOutpostArn;
 
     // subnet.attrNetworkAclAssociationId is the default ACL after the subnet
     // was just created. However, the ACL can be replaced at a later time.
     this._networkAcl = NetworkAcl.fromNetworkAclId(this, 'Acl', subnet.attrNetworkAclAssociationId);
-    this.subnetNetworkAclAssociationId = Lazy.stringValue({ produce: () => this._networkAcl.networkAclId });
+    this.subnetNetworkAclAssociationId = Lazy.string({ produce: () => this._networkAcl.networkAclId });
     this.node.defaultChild = subnet;
 
     const table = new CfnRouteTable(this, 'RouteTable', {
@@ -1568,7 +1605,7 @@ export class Subnet extends Resource implements ISubnet {
    * explicit DENY entries that you add.
    *
    * You can replace it with a custom ACL which denies all traffic except
-   * the explic it ALLOW entries that you add by creating a `NetworkAcl`
+   * the explicit ALLOW entries that you add by creating a `NetworkAcl`
    * object and calling `associateNetworkAcl()`.
    */
   public get networkAcl(): INetworkAcl {
@@ -1576,7 +1613,7 @@ export class Subnet extends Resource implements ISubnet {
   }
 
   /**
-   * Adds an entry to this subnets route table that points to the passed NATGatwayId
+   * Adds an entry to this subnets route table that points to the passed NATGatewayId
    * @param natGatewayId The ID of the NAT gateway
    */
   public addDefaultNatRoute(natGatewayId: string) {
@@ -1610,9 +1647,9 @@ export class Subnet extends Resource implements ISubnet {
   public associateNetworkAcl(id: string, networkAcl: INetworkAcl) {
     this._networkAcl = networkAcl;
 
-    const scope = Construct.isConstruct(networkAcl) ? networkAcl : this;
-    const other = Construct.isConstruct(networkAcl) ? this : networkAcl;
-    new SubnetNetworkAclAssociation(scope, id + other.node.uniqueId, {
+    const scope = CoreConstruct.isConstruct(networkAcl) ? networkAcl : this;
+    const other = CoreConstruct.isConstruct(networkAcl) ? this : networkAcl;
+    new SubnetNetworkAclAssociation(scope, id + Names.nodeUniqueId(other.node), {
       networkAcl,
       subnet: this,
     });
@@ -1767,7 +1804,7 @@ export class PrivateSubnet extends Subnet implements IPrivateSubnet {
 }
 
 function ifUndefined<T>(value: T | undefined, defaultValue: T): T {
-  return value !== undefined ? value : defaultValue;
+  return value ?? defaultValue;
 }
 
 class ImportedVpc extends VpcBase {
@@ -1787,6 +1824,13 @@ class ImportedVpc extends VpcBase {
     this.availabilityZones = props.availabilityZones;
     this._vpnGatewayId = props.vpnGatewayId;
     this.incompleteSubnetDefinition = isIncomplete;
+
+    // None of the values may be unresolved list tokens
+    for (const k of Object.keys(props) as Array<keyof VpcAttributes>) {
+      if (Array.isArray(props[k]) && Token.isUnresolved(props[k])) {
+        Annotations.of(this).addWarning(`fromVpcAttributes: '${k}' is a list token: the imported VPC will not work with constructs that require a list of subnets at synthesis time. Use 'Vpc.fromLookup()' or 'Fn.importListValue' instead.`);
+      }
+    }
 
     /* eslint-disable max-len */
     const pub = new ImportSubnetGroup(props.publicSubnetIds, props.publicSubnetNames, props.publicSubnetRouteTableIds, SubnetType.PUBLIC, this.availabilityZones, 'publicSubnetIds', 'publicSubnetNames', 'publicSubnetRouteTableIds');
@@ -1858,6 +1902,7 @@ class LookedUpVpc extends VpcBase {
         availabilityZone: vpcSubnet.availabilityZone,
         subnetId: vpcSubnet.subnetId,
         routeTableId: vpcSubnet.routeTableId,
+        ipv4CidrBlock: vpcSubnet.cidr,
       }));
     }
     return ret;
@@ -1915,8 +1960,22 @@ class ImportedSubnet extends Resource implements ISubnet, IPublicSubnet, IPrivat
     super(scope, id);
 
     if (!attrs.routeTableId) {
-      const ref = Token.isUnresolved(attrs.subnetId)
-        ? `at '${scope.node.path}/${id}'`
+      // The following looks a little weird, but comes down to:
+      //
+      // * Is the subnetId itself unresolved ({ Ref: Subnet }); or
+      // * Was it the accidentally extracted first element of a list-encoded
+      //   token? ({ Fn::ImportValue: Subnets } => ['#{Token[1234]}'] =>
+      //   '#{Token[1234]}'
+      //
+      // There's no other API to test for the second case than to the string back into
+      // a list and see if the combination is Unresolved.
+      //
+      // In both cases we can't output the subnetId literally into the metadata (because it'll
+      // be useless). In the 2nd case even, if we output it to metadata, the `resolve()` call
+      // that gets done on the metadata will even `throw`, because the '#{Token}' value will
+      // occur in an illegal position (not in a list context).
+      const ref = Token.isUnresolved(attrs.subnetId) || Token.isUnresolved([attrs.subnetId])
+        ? `at '${Node.of(scope).path}/${id}'`
         : `'${attrs.subnetId}'`;
       // eslint-disable-next-line max-len
       Annotations.of(this).addWarning(`No routeTableId was provided to the subnet ${ref}. Attempting to read its .routeTable.routeTableId will return null/undefined. (More info: https://github.com/aws/aws-cdk/pull/3171)`);
@@ -1948,9 +2007,9 @@ class ImportedSubnet extends Resource implements ISubnet, IPublicSubnet, IPrivat
   }
 
   public associateNetworkAcl(id: string, networkAcl: INetworkAcl): void {
-    const scope = Construct.isConstruct(networkAcl) ? networkAcl : this;
-    const other = Construct.isConstruct(networkAcl) ? this : networkAcl;
-    new SubnetNetworkAclAssociation(scope, id + other.node.uniqueId, {
+    const scope = CoreConstruct.isConstruct(networkAcl) ? networkAcl : this;
+    const other = CoreConstruct.isConstruct(networkAcl) ? this : networkAcl;
+    new SubnetNetworkAclAssociation(scope, id + Names.nodeUniqueId(other.node), {
       networkAcl,
       subnet: this,
     });

@@ -1,6 +1,6 @@
-// import { SynthUtils } from '@aws-cdk/assert';
-import { ResourcePart } from '@aws-cdk/assert';
-import '@aws-cdk/assert/jest';
+// import { SynthUtils } from '@aws-cdk/assert-internal';
+import { ResourcePart } from '@aws-cdk/assert-internal';
+import '@aws-cdk/assert-internal/jest';
 import * as lambda from '@aws-cdk/aws-lambda';
 import * as s3 from '@aws-cdk/aws-s3';
 import { Stack, App } from '@aws-cdk/core';
@@ -100,6 +100,22 @@ test('lambda in a different stack as notification target', () => {
       ],
     },
   });
+});
+
+test('imported lambda in a different account as notification target', () => {
+  const app = new App();
+  const stack = new Stack(app, 'stack', {
+    env: { account: '111111111111' },
+  });
+
+  // Lambda account and stack account differ; no permissions should be created.
+  const lambdaFunction = lambda.Function.fromFunctionArn(stack, 'lambdaFunction', 'arn:aws:lambda:us-east-1:123456789012:function:BaseFunction');
+  const bucket = new s3.Bucket(stack, 'bucket');
+
+  bucket.addObjectCreatedNotification(new s3n.LambdaDestination(lambdaFunction));
+
+  // no permissions created
+  expect(stack).not.toHaveResourceLike('AWS::Lambda::Permission');
 });
 
 test('lambda as notification target', () => {

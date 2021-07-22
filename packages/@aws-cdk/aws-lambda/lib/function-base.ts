@@ -9,7 +9,7 @@ import { EventSourceMapping, EventSourceMappingOptions } from './event-source-ma
 import { IVersion } from './lambda-version';
 import { CfnPermission } from './lambda.generated';
 import { Permission } from './permission';
-import { addAlias } from './util';
+import { addAlias, flatMap } from './util';
 
 export interface IFunction extends IResource, ec2.IConnectable, iam.IGrantable {
 
@@ -21,7 +21,7 @@ export interface IFunction extends IResource, ec2.IConnectable, iam.IGrantable {
   readonly functionName: string;
 
   /**
-   * The ARN fo the function.
+   * The ARN of the function.
    *
    * @attribute
    */
@@ -65,7 +65,7 @@ export interface IFunction extends IResource, ec2.IConnectable, iam.IGrantable {
 
   /**
    * Adds a permission to the Lambda resource policy.
-   * @param id The id ƒor the permission construct
+   * @param id The id for the permission construct
    * @param permission The permission to grant to this Lambda function. @see Permission for details.
    */
   addPermission(id: string, permission: Permission): void;
@@ -106,6 +106,17 @@ export interface IFunction extends IResource, ec2.IConnectable, iam.IGrantable {
    */
   metricThrottles(props?: cloudwatch.MetricOptions): cloudwatch.Metric;
 
+  /**
+   * Adds an event source to this function.
+   *
+   * Event sources are implemented in the @aws-cdk/aws-lambda-event-sources module.
+   *
+   * The following example adds an SQS Queue as an event source:
+   * ```
+   * import { SqsEventSource } from '@aws-cdk/aws-lambda-event-sources';
+   * myFunction.addEventSource(new SqsEventSource(myQueue));
+   * ```
+   */
   addEventSource(source: IEventSource): void;
 
   /**
@@ -149,9 +160,22 @@ export interface FunctionAttributes {
    * to this Lambda.
    */
   readonly securityGroup?: ec2.ISecurityGroup;
+
+  /**
+   * Setting this property informs the CDK that the imported function is in the same environment as the stack.
+   * This affects certain behaviours such as, whether this function's permission can be modified.
+   * When not configured, the CDK attempts to auto-determine this. For environment agnostic stacks, i.e., stacks
+   * where the account is not specified with the `env` property, this is determined to be false.
+   *
+   * Set this to property *ONLY IF* the imported function is in the same account as the stack
+   * it's imported in.
+   * @default - depends: true, if the Stack is configured with an explicit `env` (account and region) and the account is the same as this function.
+   * For environment-agnostic stacks this will default to `false`.
+   */
+  readonly sameEnvironment?: boolean;
 }
 
-export abstract class FunctionBase extends Resource implements IFunction {
+export abstract class FunctionBase extends Resource implements IFunction, ec2.IClientVpnConnectionHandler {
   /**
    * The principal this Lambda Function is running as
    */
@@ -205,26 +229,27 @@ export abstract class FunctionBase extends Resource implements IFunction {
 
   /**
    * Adds a permission to the Lambda resource policy.
-   * @param id The id ƒor the permission construct
+   * @param id The id for the permission construct
    * @param permission The permission to grant to this Lambda function. @see Permission for details.
    */
   public addPermission(id: string, permission: Permission) {
     if (!this.canCreatePermissions) {
-      // FIXME: Report metadata
+      // FIXME: @deprecated(v2) - throw an error if calling `addPermission` on a resource that doesn't support it.
       return;
     }
 
     const principal = this.parsePermissionPrincipal(permission.principal);
-    const action = permission.action || 'lambda:InvokeFunction';
-    const scope = permission.scope || this;
+    const { sourceAccount, sourceArn } = this.parseConditions(permission.principal) ?? {};
+    const action = permission.action ?? 'lambda:InvokeFunction';
+    const scope = permission.scope ?? this;
 
     new CfnPermission(scope, id, {
       action,
       principal,
       functionName: this.functionArn,
       eventSourceToken: permission.eventSourceToken,
-      sourceAccount: permission.sourceAccount,
-      sourceArn: permission.sourceArn,
+      sourceAccount: permission.sourceAccount ?? sourceAccount,
+      sourceArn: permission.sourceArn ?? sourceArn,
     });
   }
 
@@ -236,7 +261,7 @@ export abstract class FunctionBase extends Resource implements IFunction {
       return;
     }
 
-    this.role.addToPolicy(statement);
+    this.role.addToPrincipalPolicy(statement);
   }
 
   /**
@@ -299,7 +324,12 @@ export abstract class FunctionBase extends Resource implements IFunction {
               action: 'lambda:InvokeFunction',
             });
 
-            return { statementAdded: true, policyDependable: this._functionNode().findChild(identifier) } as iam.AddToResourcePolicyResult;
+            const permissionNode = this._functionNode().tryFindChild(identifier);
+            if (!permissionNode) {
+              throw new Error('Cannot modify permission to lambda function. Function is either imported or $LATEST version. '
+                + 'If the function is imported from the same account use `fromFunctionAttributes()` API with the `sameEnvironment` flag.');
+            }
+            return { statementAdded: true, policyDependable: permissionNode };
           },
           node: this.node,
           stack: this.stack,
@@ -311,18 +341,6 @@ export abstract class FunctionBase extends Resource implements IFunction {
     return grant;
   }
 
-  /**
-   * Adds an event source to this function.
-   *
-   * Event sources are implemented in the @aws-cdk/aws-lambda-event-sources module.
-   *
-   * The following example adds an SQS Queue as an event source:
-   *
-   *     import { SqsEventSource } from '@aws-cdk/aws-lambda-event-sources';
-   *     myFunction.addEventSource(new SqsEventSource(myQueue));
-   *
-   * @param source The event source to bind to this function
-   */
   public addEventSource(source: IEventSource) {
     source.bind(this);
   }
@@ -357,7 +375,7 @@ export abstract class FunctionBase extends Resource implements IFunction {
    * ..which means that in order to extract the `account-id` component from the ARN, we can
    * split the ARN using ":" and select the component in index 4.
    *
-   * @returns true if account id of function matches this account
+   * @returns true if account id of function matches the account specified on the stack, false otherwise.
    *
    * @internal
    */
@@ -378,14 +396,15 @@ export abstract class FunctionBase extends Resource implements IFunction {
    * Try to recognize some specific Principal classes first, then try a generic
    * fallback.
    */
-  private parsePermissionPrincipal(principal?: iam.IPrincipal) {
-    if (!principal) {
-      return undefined;
-    }
-
+  private parsePermissionPrincipal(principal: iam.IPrincipal) {
     // Try some specific common classes first.
     // use duck-typing, not instance of
     // @deprecated: after v2, we can change these to 'instanceof'
+    if ('conditions' in principal) {
+      // eslint-disable-next-line dot-notation
+      principal = principal['principal'];
+    }
+
     if ('accountId' in principal) {
       return (principal as iam.AccountPrincipal).accountId;
     }
@@ -413,6 +432,39 @@ export abstract class FunctionBase extends Resource implements IFunction {
 
     throw new Error(`Invalid principal type for Lambda permission statement: ${principal.constructor.name}. ` +
       'Supported: AccountPrincipal, ArnPrincipal, ServicePrincipal');
+  }
+
+  private parseConditions(principal: iam.IPrincipal): { sourceAccount: string, sourceArn: string } | null {
+    if (this.isPrincipalWithConditions(principal)) {
+      const conditions: iam.Conditions = principal.policyFragment.conditions;
+      const conditionPairs = flatMap(
+        Object.entries(conditions),
+        ([operator, conditionObjs]) => Object.keys(conditionObjs as object).map(key => { return { operator, key }; }),
+      );
+      const supportedPrincipalConditions = [{ operator: 'ArnLike', key: 'aws:SourceArn' }, { operator: 'StringEquals', key: 'aws:SourceAccount' }];
+
+      const unsupportedConditions = conditionPairs.filter(
+        (condition) => !supportedPrincipalConditions.some(
+          (supportedCondition) => supportedCondition.operator === condition.operator && supportedCondition.key === condition.key,
+        ),
+      );
+
+      if (unsupportedConditions.length == 0) {
+        return {
+          sourceAccount: conditions.StringEquals['aws:SourceAccount'],
+          sourceArn: conditions.ArnLike['aws:SourceArn'],
+        };
+      } else {
+        throw new Error(`PrincipalWithConditions had unsupported conditions for Lambda permission statement: ${JSON.stringify(unsupportedConditions)}. ` +
+          `Supported operator/condition pairs: ${JSON.stringify(supportedPrincipalConditions)}`);
+      }
+    } else {
+      return null;
+    }
+  }
+
+  private isPrincipalWithConditions(principal: iam.IPrincipal): principal is iam.PrincipalWithConditions {
+    return 'conditions' in principal;
   }
 }
 

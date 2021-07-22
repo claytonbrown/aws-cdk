@@ -1,6 +1,7 @@
 import * as ec2 from '@aws-cdk/aws-ec2';
 import * as iam from '@aws-cdk/aws-iam';
-import { Construct, IResource, Resource, Stack } from '@aws-cdk/core';
+import { IResource, Resource, Stack } from '@aws-cdk/core';
+import { Construct } from 'constructs';
 import { CfnComputeEnvironment } from './batch.generated';
 
 /**
@@ -176,6 +177,13 @@ export interface ComputeResources {
    * @default 0
    */
   readonly minvCpus?: number;
+
+  /**
+   * The Amazon EC2 placement group to associate with your compute resources.
+   *
+   * @default - No placement group will be used.
+   */
+  readonly placementGroup?: string;
 
   /**
    * The EC2 key pair that is used for instances launched in the compute environment.
@@ -364,8 +372,9 @@ export class ComputeEnvironment extends Resource implements IComputeEnvironment 
         launchTemplate: props.computeResources.launchTemplate,
         maxvCpus: props.computeResources.maxvCpus || 256,
         minvCpus: props.computeResources.minvCpus || 0,
+        placementGroup: props.computeResources.placementGroup,
         securityGroupIds: this.buildSecurityGroupIds(props.computeResources.vpc, props.computeResources.securityGroups),
-        spotIamFleetRole: spotFleetRole ? spotFleetRole.roleArn : undefined,
+        spotIamFleetRole: spotFleetRole?.roleArn,
         subnets: props.computeResources.vpc.selectSubnets(props.computeResources.vpcSubnets).subnetIds,
         tags: props.computeResources.computeResourcesTags,
         type: props.computeResources.type || ComputeResourceType.ON_DEMAND,
@@ -375,9 +384,8 @@ export class ComputeEnvironment extends Resource implements IComputeEnvironment 
     const computeEnvironment = new CfnComputeEnvironment(this, 'Resource', {
       computeEnvironmentName: this.physicalName,
       computeResources,
-      serviceRole: props.serviceRole
-        ? props.serviceRole.roleArn
-        : new iam.Role(this, 'Resource-Service-Instance-Role', {
+      serviceRole: props.serviceRole?.roleArn
+        ?? new iam.Role(this, 'Resource-Service-Instance-Role', {
           managedPolicies: [
             iam.ManagedPolicy.fromAwsManagedPolicyName('service-role/AWSBatchServiceRole'),
           ],
@@ -400,7 +408,7 @@ export class ComputeEnvironment extends Resource implements IComputeEnvironment 
   }
 
   private isManaged(props: ComputeEnvironmentProps): boolean {
-    return props.managed === undefined ? true : props.managed;
+    return props.managed ?? true;
   }
 
   /**

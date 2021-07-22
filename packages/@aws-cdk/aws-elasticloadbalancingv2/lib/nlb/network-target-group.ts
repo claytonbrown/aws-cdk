@@ -1,4 +1,6 @@
+import * as cloudwatch from '@aws-cdk/aws-cloudwatch';
 import * as cdk from '@aws-cdk/core';
+import { Construct } from 'constructs';
 import {
   BaseTargetGroupProps, HealthCheck, ITargetGroup, loadBalancerNameFromListenerArn, LoadBalancerTargetProps,
   TargetGroupAttributes, TargetGroupBase, TargetGroupImportProps,
@@ -32,6 +34,14 @@ export interface NetworkTargetGroupProps extends BaseTargetGroupProps {
   readonly proxyProtocolV2?: boolean;
 
   /**
+   * Indicates whether client IP preservation is enabled.
+   *
+   * @default false if the target group type is IP address and the
+   * target group protocol is TCP or TLS. Otherwise, true.
+   */
+  readonly preserveClientIp?: boolean;
+
+  /**
    * The targets to add to this target group.
    *
    * Can be `Instance`, `IPAddress`, or any self-registering load balancing
@@ -50,7 +60,7 @@ export class NetworkTargetGroup extends TargetGroupBase implements INetworkTarge
   /**
    * Import an existing target group
    */
-  public static fromTargetGroupAttributes(scope: cdk.Construct, id: string, attrs: TargetGroupAttributes): INetworkTargetGroup {
+  public static fromTargetGroupAttributes(scope: Construct, id: string, attrs: TargetGroupAttributes): INetworkTargetGroup {
     return new ImportedNetworkTargetGroup(scope, id, attrs);
   }
 
@@ -59,13 +69,13 @@ export class NetworkTargetGroup extends TargetGroupBase implements INetworkTarge
    *
    * @deprecated Use `fromTargetGroupAttributes` instead
    */
-  public static import(scope: cdk.Construct, id: string, props: TargetGroupImportProps): INetworkTargetGroup {
+  public static import(scope: Construct, id: string, props: TargetGroupImportProps): INetworkTargetGroup {
     return NetworkTargetGroup.fromTargetGroupAttributes(scope, id, props);
   }
 
   private readonly listeners: INetworkListener[];
 
-  constructor(scope: cdk.Construct, id: string, props: NetworkTargetGroupProps) {
+  constructor(scope: Construct, id: string, props: NetworkTargetGroupProps) {
     const proto = props.protocol || Protocol.TCP;
     validateNetworkProtocol(proto);
 
@@ -78,6 +88,10 @@ export class NetworkTargetGroup extends TargetGroupBase implements INetworkTarge
 
     if (props.proxyProtocolV2 != null) {
       this.setAttribute('proxy_protocol_v2.enabled', props.proxyProtocolV2 ? 'true' : 'false');
+    }
+
+    if (props.preserveClientIp !== undefined) {
+      this.setAttribute('preserve_client_ip.enabled', props.preserveClientIp ? 'true' : 'false');
     }
 
     this.addTarget(...(props.targets || []));
@@ -101,6 +115,30 @@ export class NetworkTargetGroup extends TargetGroupBase implements INetworkTarge
   public registerListener(listener: INetworkListener) {
     this.loadBalancerAttachedDependencies.add(listener);
     this.listeners.push(listener);
+  }
+
+  /**
+   * The number of targets that are considered healthy.
+   *
+   * @default Average over 5 minutes
+   */
+  public metricHealthyHostCount(props?: cloudwatch.MetricOptions) {
+    return this.metric('HealthyHostCount', {
+      statistic: 'Average',
+      ...props,
+    });
+  }
+
+  /**
+   * The number of targets that are considered unhealthy.
+   *
+   * @default Average over 5 minutes
+   */
+  public metricUnHealthyHostCount(props?: cloudwatch.MetricOptions) {
+    return this.metric('UnHealthyHostCount', {
+      statistic: 'Average',
+      ...props,
+    });
   }
 
   /**
@@ -141,7 +179,7 @@ export class NetworkTargetGroup extends TargetGroupBase implements INetworkTarge
     }
 
     if (healthCheck.healthyThresholdCount && healthCheck.unhealthyThresholdCount &&
-        healthCheck.healthyThresholdCount !== healthCheck.unhealthyThresholdCount) {
+      healthCheck.healthyThresholdCount !== healthCheck.unhealthyThresholdCount) {
       ret.push([
         `Healthy and Unhealthy Threshold Counts must be the same: ${healthCheck.healthyThresholdCount}`,
         `is not equal to ${healthCheck.unhealthyThresholdCount}.`,
@@ -169,6 +207,15 @@ export class NetworkTargetGroup extends TargetGroupBase implements INetworkTarge
     }
 
     return ret;
+  }
+
+  private metric(metricName: string, props?: cloudwatch.MetricOptions): cloudwatch.Metric {
+    return new cloudwatch.Metric({
+      namespace: 'AWS/NetworkELB',
+      metricName,
+      dimensions: { LoadBalancer: this.firstLoadBalancerFullName, TargetGroup: this.targetGroupFullName },
+      ...props,
+    }).attachTo(this);
   }
 }
 
@@ -222,7 +269,7 @@ export interface INetworkLoadBalancerTarget {
 
 const NLB_HEALTH_CHECK_PROTOCOLS = [Protocol.HTTP, Protocol.HTTPS, Protocol.TCP];
 const NLB_PATH_HEALTH_CHECK_PROTOCOLS = [Protocol.HTTP, Protocol.HTTPS];
-const NLB_HEALTH_CHECK_TIMEOUTS: {[protocol in Protocol]?: number} = {
+const NLB_HEALTH_CHECK_TIMEOUTS: { [protocol in Protocol]?: number } = {
   [Protocol.HTTP]: 6,
   [Protocol.HTTPS]: 10,
   [Protocol.TCP]: 10,

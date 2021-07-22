@@ -1,6 +1,6 @@
 import * as path from 'path';
-import { ABSENT, ResourcePart } from '@aws-cdk/assert';
-import '@aws-cdk/assert/jest';
+import { ABSENT, ResourcePart } from '@aws-cdk/assert-internal';
+import '@aws-cdk/assert-internal/jest';
 import * as s3 from '@aws-cdk/aws-s3';
 import * as core from '@aws-cdk/core';
 import * as inc from '../lib';
@@ -334,6 +334,28 @@ describe('CDK Include for nested stacks', () => {
     }).toThrow(/Nested Stack 'AnotherChildStack' was not included in the parent template/);
   });
 
+  test('correctly handles references in nested stacks Parameters', () => {
+    new inc.CfnInclude(stack, 'ParentStack', {
+      templateFile: testTemplateFilePath('cross-stack-refs.json'),
+      loadNestedStacks: {
+        'ChildStack': {
+          templateFile: testTemplateFilePath('child-import-stack.json'),
+        },
+      },
+    });
+
+    expect(stack).toHaveResourceLike('AWS::CloudFormation::Stack', {
+      "Parameters": {
+        "Param1": {
+          "Ref": "Param",
+        },
+        "Param2": {
+          "Fn::GetAtt": ["Bucket", "Arn"],
+        },
+      },
+    });
+  });
+
   test('correctly handles renaming of references across nested stacks', () => {
     const parentTemplate = new inc.CfnInclude(stack, 'ParentStack', {
       templateFile: testTemplateFilePath('cross-stack-refs.json'),
@@ -386,13 +408,10 @@ describe('CDK Include for nested stacks', () => {
   });
 
   test("handles Metadata, DeletionPolicy, and UpdateReplacePolicy attributes of the nested stack's resource", () => {
-    const cfnTemplate = new inc.CfnInclude(stack, 'ParentStack', {
+    new inc.CfnInclude(stack, 'ParentStack', {
       templateFile: testTemplateFilePath('parent-with-attributes.json'),
       loadNestedStacks: {
         'ChildStack': {
-          templateFile: testTemplateFilePath('child-import-stack.json'),
-        },
-        'AnotherChildStack': {
           templateFile: testTemplateFilePath('child-import-stack.json'),
         },
       },
@@ -408,19 +427,49 @@ describe('CDK Include for nested stacks', () => {
       ],
       "UpdateReplacePolicy": "Retain",
     }, ResourcePart.CompleteDefinition);
-
-    cfnTemplate.getNestedStack('AnotherChildStack');
   });
 
   test('correctly parses NotificationsARNs, Timeout', () => {
     new inc.CfnInclude(stack, 'ParentStack', {
       templateFile: testTemplateFilePath('parent-with-attributes.json'),
+      loadNestedStacks: {
+        'ChildStack': {
+          templateFile: testTemplateFilePath('custom-resource.json'),
+        },
+        'AnotherChildStack': {
+          templateFile: testTemplateFilePath('custom-resource.json'),
+        },
+      },
     });
 
     expect(stack).toHaveResourceLike('AWS::CloudFormation::Stack', {
-      "TemplateURL": "https://cfn-templates-set.s3.amazonaws.com/child-import-stack.json",
       "NotificationARNs": ["arn1"],
       "TimeoutInMinutes": 5,
+    });
+    expect(stack).toHaveResourceLike('AWS::CloudFormation::Stack', {
+      "NotificationARNs": { "Ref": "ArrayParam" },
+      "TimeoutInMinutes": {
+        "Fn::Select": [0, {
+          "Ref": "ArrayParam",
+        }],
+      },
+    });
+  });
+
+  test('can ingest a NestedStack with a Number CFN Parameter passed as a number', () => {
+    new inc.CfnInclude(stack, 'MyScope', {
+      templateFile: testTemplateFilePath('parent-number-in-child-params.yaml'),
+      loadNestedStacks: {
+        'NestedStack': {
+          templateFile: testTemplateFilePath('child-with-number-parameter.yaml'),
+        },
+      },
+    });
+
+    expect(stack).toHaveResourceLike('AWS::CloudFormation::Stack', {
+      "Parameters": {
+        "Number": "60",
+      },
     });
   });
 
@@ -443,6 +492,9 @@ describe('CDK Include for nested stacks', () => {
     let parentTemplate: inc.CfnInclude;
     let child: inc.IncludedNestedStack;
     let grandChild: inc.IncludedNestedStack;
+
+    let hash1: string;
+    let hash2: string;
 
     let parentBucketParam: string;
     let parentKeyParam: string;
@@ -471,13 +523,16 @@ describe('CDK Include for nested stacks', () => {
       child = parentTemplate.getNestedStack('ChildStack');
       grandChild = child.includedTemplate.getNestedStack('GrandChildStack');
 
-      parentBucketParam = 'AssetParameters5dc7d4a99cfe2979687dc74f2db9fd75f253b5505a1912b5ceecf70c9aefba50S3BucketEAA24F0C';
-      parentKeyParam = 'AssetParameters5dc7d4a99cfe2979687dc74f2db9fd75f253b5505a1912b5ceecf70c9aefba50S3VersionKey1194CAB2';
-      grandChildBucketParam = 'referencetoAssetParameters5dc7d4a99cfe2979687dc74f2db9fd75f253b5505a1912b5ceecf70c9aefba50S3BucketEAA24F0CRef';
-      grandChildKeyParam = 'referencetoAssetParameters5dc7d4a99cfe2979687dc74f2db9fd75f253b5505a1912b5ceecf70c9aefba50S3VersionKey1194CAB2Ref';
+      hash1 = '5dc7d4a99cfe2979687dc74f2db9fd75f253b5505a1912b5ceecf70c9aefba50';
+      hash2 = '7775730164edb5faae717ac1d2e90d9c0d0fdbeafe48763e5c1b7fb5e39e00a5';
 
-      childBucketParam = 'AssetParameters891fd3ec75dc881b0fe40dc9fd1b433672637585c015265a5f0dab6bf79818d5S3Bucket23278F13';
-      childKeyParam = 'AssetParameters891fd3ec75dc881b0fe40dc9fd1b433672637585c015265a5f0dab6bf79818d5S3VersionKey7316205A';
+      parentBucketParam = `AssetParameters${hash1}S3BucketEAA24F0C`;
+      parentKeyParam = `AssetParameters${hash1}S3VersionKey1194CAB2`;
+      grandChildBucketParam = `referencetoAssetParameters${hash1}S3BucketEAA24F0CRef`;
+      grandChildKeyParam = `referencetoAssetParameters${hash1}S3VersionKey1194CAB2Ref`;
+
+      childBucketParam = `AssetParameters${hash2}S3BucketDEB194C6`;
+      childKeyParam = `AssetParameters${hash2}S3VersionKey8B342ED1`;
     });
 
     test('correctly creates parameters in the parent stack, and passes them to the child stack', () => {
@@ -485,27 +540,27 @@ describe('CDK Include for nested stacks', () => {
         "Parameters": {
           [parentBucketParam]: {
             "Type": "String",
-            "Description": "S3 bucket for asset \"5dc7d4a99cfe2979687dc74f2db9fd75f253b5505a1912b5ceecf70c9aefba50\"",
+            "Description": `S3 bucket for asset \"${hash1}\"`,
           },
           [parentKeyParam]: {
             "Type": "String",
-            "Description": "S3 key for asset version \"5dc7d4a99cfe2979687dc74f2db9fd75f253b5505a1912b5ceecf70c9aefba50\"",
+            "Description": `S3 key for asset version \"${hash1}\"`,
           },
-          "AssetParameters5dc7d4a99cfe2979687dc74f2db9fd75f253b5505a1912b5ceecf70c9aefba50ArtifactHash9C417847": {
+          [`AssetParameters${hash1}ArtifactHash9C417847`]: {
             "Type": "String",
-            "Description": "Artifact hash for asset \"5dc7d4a99cfe2979687dc74f2db9fd75f253b5505a1912b5ceecf70c9aefba50\"",
+            "Description": `Artifact hash for asset \"${hash1}\"`,
           },
           [childBucketParam]: {
             "Type": "String",
-            "Description": "S3 bucket for asset \"891fd3ec75dc881b0fe40dc9fd1b433672637585c015265a5f0dab6bf79818d5\"",
+            "Description": `S3 bucket for asset \"${hash2}\"`,
           },
           [childKeyParam]: {
             "Type": "String",
-            "Description": "S3 key for asset version \"891fd3ec75dc881b0fe40dc9fd1b433672637585c015265a5f0dab6bf79818d5\"",
+            "Description": `S3 key for asset version \"${hash2}\"`,
           },
-          "AssetParameters891fd3ec75dc881b0fe40dc9fd1b433672637585c015265a5f0dab6bf79818d5ArtifactHashA1DE5198": {
+          [`AssetParameters${hash2}ArtifactHashAA82D4CC`]: {
             "Type": "String",
-            "Description": "Artifact hash for asset \"891fd3ec75dc881b0fe40dc9fd1b433672637585c015265a5f0dab6bf79818d5\"",
+            "Description": `Artifact hash for asset \"${hash2}\"`,
           },
         },
         "Resources": {
